@@ -2,6 +2,8 @@
     opts = TestItemApp.parse_run_args(String[])
     @test opts.path == pwd()
     @test opts.filter_str === nothing
+    @test isempty(opts.packages)
+    @test isempty(opts.exclude_packages)
     @test opts.timeout === nothing
     @test opts.activation_timeout === nothing
     @test opts.profile_name == "Default"
@@ -11,10 +13,14 @@
     @test opts.progress == :bar
     @test opts.output == :issues
     @test opts.stream == false
+    # Computed from the machine's CPUs and memory when the arguments are parsed.
+    @test opts.max_workers == TestItemApp.TestItemRuns.default_max_workers()
+    @test opts.max_workers >= 1
     @test opts.threads === nothing
     @test opts.coverage == false
     @test opts.coverage_lcov === nothing
     @test opts.coverage_cobertura === nothing
+    # `nothing` leaves both to TestItemControllers, where they default to off.
     @test opts.gc_between_testitems === nothing
     @test opts.memory_threshold === nothing
     @test opts.schedule == :duration
@@ -67,6 +73,51 @@ end
         @test opts.schedule == :contiguous
     end
     @test space == equals
+end
+
+@testitem "parse_run_args package selection" begin
+    space = TestItemApp.parse_run_args(String["--packages", "A,B", "--exclude-packages", "C"])
+    equals = TestItemApp.parse_run_args(String["--packages=A,B", "--exclude-packages=C"])
+    for opts in (space, equals)
+        @test opts.packages == ["A", "B"]
+        @test opts.exclude_packages == ["C"]
+    end
+    @test space == equals
+
+    # Repeating accumulates, and surrounding whitespace is not part of a package name.
+    accumulated = TestItemApp.parse_run_args(String["--packages", "A", "--packages", "B, C"])
+    @test accumulated.packages == ["A", "B", "C"]
+
+    # An empty entry is a typo, not "no package".
+    @test_throws TestItemApp.CliError TestItemApp.parse_run_args(String["--packages", "A,,B"])
+    @test_throws TestItemApp.CliError TestItemApp.parse_run_args(String["--packages", ""])
+    @test_throws TestItemApp.CliError TestItemApp.parse_run_args(String["--exclude-packages", "A,"])
+end
+
+@testitem "make_package_filter" begin
+    item(pkg) = (filename="f.jl", name="n", tags=Symbol[], package_name=pkg)
+
+    @test TestItemApp.make_package_filter(String[], String[]) === nothing
+
+    include_only = TestItemApp.make_package_filter(["A", "B"], String[])
+    @test include_only(item("A"))
+    @test include_only(item("B"))
+    @test !include_only(item("C"))
+    # Package names are case sensitive, and an item belonging to no package is not "A".
+    @test !include_only(item("a"))
+    @test !include_only(item(""))
+
+    exclude_only = TestItemApp.make_package_filter(String[], ["C"])
+    @test exclude_only(item("A"))
+    @test !exclude_only(item("C"))
+    # Without --packages, an item belonging to no package still runs.
+    @test exclude_only(item(""))
+
+    # Include first, then exclude.
+    both = TestItemApp.make_package_filter(["A", "B"], ["B"])
+    @test both(item("A"))
+    @test !both(item("B"))
+    @test !both(item("C"))
 end
 
 @testitem "parse_run_args activation timeout is opt-in" begin
@@ -129,11 +180,26 @@ end
     @test TestItemApp.parse_run_args(String["--gc-between-testitems"]).gc_between_testitems == true
     @test TestItemApp.parse_run_args(String["--no-gc-between-testitems"]).gc_between_testitems == false
 
-    @test TestItemApp.parse_run_args(String["--stream", "--max-workers", "1"]).stream == true
-    # Live output from several processes would interleave arbitrarily.
-    @test_throws TestItemApp.CliError TestItemApp.parse_run_args(String["--stream"])
-    @test_throws TestItemApp.CliError TestItemApp.parse_run_args(String["--stream", "--max-workers", "4"])
+    # Live output from several processes would interleave arbitrarily, so `--stream` implies
+    # a single test process -- whatever the machine-dependent default would have been.
+    opts = TestItemApp.parse_run_args(String["--stream"])
+    @test opts.stream == true
+    @test opts.max_workers == 1
+
+    opts = TestItemApp.parse_run_args(String["--stream", "--max-workers", "1"])
+    @test opts.stream == true
+    @test opts.max_workers == 1
+    opts = TestItemApp.parse_run_args(String["--max-workers=1", "--stream"])
+    @test opts.stream == true
+    @test opts.max_workers == 1
+
+    # Only an explicit, conflicting worker count is an error, in either order.
+    @test_throws TestItemApp.CliError TestItemApp.parse_run_args(String["--stream", "--max-workers", "3"])
+    @test_throws TestItemApp.CliError TestItemApp.parse_run_args(String["--max-workers", "3", "--stream"])
     @test TestItemApp.real_main(["--stream", "--max-workers", "2"]) == 2
+
+    # Without --stream, an explicit --max-workers is taken as given.
+    @test TestItemApp.parse_run_args(String["--max-workers", "3"]).max_workers == 3
 end
 
 @testitem "parse_run_args new option errors" begin
